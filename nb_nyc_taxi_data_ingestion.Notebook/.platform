@@ -1,0 +1,11 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+  "metadata": {
+    "type": "Notebook",
+    "displayName": "nb_nyc_taxi_data_ingestion"
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "8c1d8fe2-4b0b-a801-4bd5-c36525c492cc"
+  }
+}

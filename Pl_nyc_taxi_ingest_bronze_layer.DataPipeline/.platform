@@ -1,0 +1,11 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+  "metadata": {
+    "type": "DataPipeline",
+    "displayName": "Pl_nyc_taxi_ingest_bronze_layer"
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "13e16805-6309-b210-438a-8fb39bdccbe4"
+  }
+}
