@@ -396,37 +396,94 @@ def source_info(url):
 # CELL ********************
 
 # Download one file and put it in lakehouse Files
+#
+# HOW THIS WORKS
+#   1. The file is downloaded into a staging folder inside the lakehouse:
+#          Files/_staging/nyc_taxi/<run_id>/
+#   2. It is checked there: not empty, fully downloaded, valid parquet.
+#   3. Only a file that passes every check is moved to its real path
+#      under Files/raw/nyc_taxi/...
+#   4. A file that fails a check is deleted from staging and the error is raised,
+#      so the loop marks it FAILED. The file already in the lakehouse is not touched.
+#
+# WHEN THE STAGING FOLDER IS CREATED AND DELETED
+#   - prepare_staging() runs once before the loop (see the "Process every file" cell).
+#   - remove_staging()  runs once after the loop, even if the loop stops with an error.
+#   - Folders left behind by a crashed run are cleared by prepare_staging() on the next run.
+#
+# Spark ignores folder names that start with "_", so staging files are never read as data.
+
+STAGING_ROOT = os.path.join(LH_MOUNT, "Files/_staging/nyc_taxi")   # one sub-folder per run
+STAGING_DIR = os.path.join(STAGING_ROOT, run_id)                   # this run's folder
+STAGING_MAX_AGE_HOURS = 6                                          # older folders are leftovers
+
+
+def prepare_staging():
+    """Run once before the loop: clear old leftovers, then create this run's staging folder."""
+    if os.path.isdir(STAGING_ROOT):
+        cutoff = time.time() - STAGING_MAX_AGE_HOURS * 3600
+        for name in os.listdir(STAGING_ROOT):
+            old_folder = os.path.join(STAGING_ROOT, name)
+            # Only folders older than the cutoff are removed,
+            # so another run that is still in progress keeps its files.
+            if os.path.isdir(old_folder) and os.path.getmtime(old_folder) < cutoff:
+                shutil.rmtree(old_folder, ignore_errors=True)
+    os.makedirs(STAGING_DIR, exist_ok=True)
+
+
+def remove_staging():
+    """Run once after the loop: delete this run's staging folder and anything left in it."""
+    shutil.rmtree(STAGING_DIR, ignore_errors=True)
+
+
 def land_file(url, landing_path):
-    """Stream the file to driver temp, validate it as parquet, then swap it into lakehouse Files."""
-    tmp_dir = tempfile.mkdtemp()
-    local_file = os.path.join(tmp_dir, os.path.basename(landing_path))
+    """Download, check and land one file. Returns rows, size and ETag for file_control."""
+    os.makedirs(STAGING_DIR, exist_ok=True)      # harmless if prepare_staging() already made it
+    staged_file = os.path.join(STAGING_DIR, os.path.basename(landing_path))
+
     try:
+        # ---- Step 1: download into the staging folder, 8 MB at a time ----
         with http.get(url, stream=True, timeout=(15, 600)) as r:
-            r.raise_for_status()
+            r.raise_for_status()                              # stop on any HTTP error
             etag = r.headers.get("ETag")
-            with open(local_file, "wb") as f:
+            expected_size = r.headers.get("Content-Length")   # size the host says it is sending
+            is_compressed = r.headers.get("Content-Encoding") # if set, sizes cannot be compared
+            with open(staged_file, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
                     f.write(chunk)
 
-        size = os.path.getsize(local_file)
-        row_count = pq.ParquetFile(local_file).metadata.num_rows   # fails if the file isn't valid parquet
+        # ---- Step 2: check the staged file ----
+        size = os.path.getsize(staged_file)
 
-        # Copy under a temp name first so a half-written file never sits at the real path.
-        # Spark ignores file names that start with "_".
+        # 2a. An empty file means the host answered but sent no content
+        if size == 0:
+            raise IOError(f"Empty download (0 bytes): {url}")
+
+        # 2b. A size different from Content-Length means the download was cut short
+        if expected_size and not is_compressed and int(expected_size) != size:
+            raise IOError(f"Incomplete download: got {size} of {expected_size} bytes: {url}")
+
+        # 2c. Reading the parquet footer proves the file is valid and gives the row count
+        row_count = pq.ParquetFile(staged_file).metadata.num_rows
+
+        # ---- Step 3: move the checked file to its real path ----
         target = os.path.join(LH_MOUNT, landing_path)
-        in_progress = os.path.join(os.path.dirname(target), "_inprogress_" + os.path.basename(target))
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        shutil.copyfile(local_file, in_progress)
-        if os.path.getsize(in_progress) != size:
-            os.remove(in_progress)
-            raise IOError(f"Size mismatch after copy: {landing_path}")
-        if os.path.exists(target):
-            os.remove(target)
-        os.rename(in_progress, target)
+        try:
+            os.replace(staged_file, target)      # one step: swaps out any older copy
+        except OSError:
+            # Fallback if the lakehouse mount refuses to overwrite in one step
+            if os.path.exists(target):
+                os.remove(target)
+            os.rename(staged_file, target)
 
         return {"rows": row_count, "size": size, "etag": etag}
+
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        # ---- Step 4: a file still in staging here has failed, so remove it ----
+        if os.path.exists(staged_file):
+            os.remove(staged_file)
+
 
 # METADATA ********************
 
@@ -438,43 +495,84 @@ def land_file(url, landing_path):
 # CELL ********************
 
 # Control table updates - one small function per outcome
-ctl = DeltaTable.forName(spark, CONTROL_TABLE)
+#
+# All three functions run a SQL UPDATE on the file control table.
+# Values are written into the SQL text through sql_value(), which turns a
+# Python value into a safe SQL literal. (The ":name" parameter style is not
+# used here because this runtime does not bind parameters for a Delta UPDATE.)
+#
+# transformation_status tells the silver notebook what to pick up:
+#   PENDING             - row registered, file not landed yet (set when the row is created)
+#   READY TO TRANSFORM  - file landed in bronze and waiting for silver (set by mark_succeeded)
+# The silver notebook reads only rows with READY TO TRANSFORM and should set its
+# own status on the row when it has finished with the file.
 
 
-def update_control(file_id, **cols):
-    cols["unique_run_id"] = F.lit(run_id)
-    cols["updated_at"] = F.current_timestamp()
-    ctl.update(condition=F.col("file_id") == file_id, set=cols)
+def sql_value(value):
+    """Turn a Python value into a SQL literal that is safe to place in a statement."""
+    if value is None:
+        return "NULL"                                  # Python None -> SQL NULL
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        return str(value)                              # numbers need no quotes
+    text = str(value)
+    text = text.replace("\\", "\\\\")                  # escape backslashes first
+    text = text.replace("'", "\\'")                    # then escape single quotes
+    return f"'{text}'"                                 # wrap the text in single quotes
 
 
 def mark_not_available(file_id):
-    update_control(file_id,
-                   ingestion_status=F.lit("NOT_AVAILABLE"),
-                   error_message=F.lit("Not published yet"))
+    """The month is not published on the source yet."""
+    spark.sql(f"""
+        UPDATE {CONTROL_TABLE}
+        SET ingestion_status = 'NOT_AVAILABLE',
+            error_message    = 'Not published yet',
+            unique_run_id    = {sql_value(run_id)},
+            updated_at       = current_timestamp()
+        WHERE file_id = {sql_value(file_id)}
+    """)
 
 
 def mark_succeeded(file_id, res):
-    # the ETag and size held so far move to the previous_ columns
-    update_control(
-        file_id,
-        ingestion_status=F.lit("SUCCEEDED"),
-        transformation_status=F.lit("PENDING"),
-        previous_etag=F.col("current_etag"),
-        previous_content_length=F.col("current_content_length"),
-        current_etag=F.lit(res["etag"]).cast("string"),
-        current_content_length=F.lit(res["size"]).cast("bigint"),
-        record_count=F.lit(res["rows"]).cast("bigint"),
-        total_retries=F.lit(0),
-        error_message=F.lit(None).cast("string"),
-        ingested_at=F.current_timestamp(),
-    )
+    """The file was downloaded, checked and landed. res holds rows, size and etag."""
+    # The ETag and size held so far move to the previous_ columns.
+    # SQL reads the old values first, so previous_etag gets the old current_etag.
+    #
+    # transformation_status is set to READY TO TRANSFORM on every successful load,
+    # including a reload of a republished file, so silver processes the new copy.
+    spark.sql(f"""
+        UPDATE {CONTROL_TABLE}
+        SET ingestion_status        = 'SUCCEEDED',
+            transformation_status   = 'READY TO TRANSFORM',
+            previous_etag           = current_etag,
+            previous_content_length = current_content_length,
+            current_etag            = {sql_value(res["etag"])},
+            current_content_length  = CAST({sql_value(res["size"])} AS BIGINT),
+            record_count            = CAST({sql_value(res["rows"])} AS BIGINT),
+            total_retries           = 0,
+            error_message           = NULL,
+            ingested_at             = current_timestamp(),
+            unique_run_id           = {sql_value(run_id)},
+            updated_at              = current_timestamp()
+        WHERE file_id = {sql_value(file_id)}
+    """)
 
 
 def mark_failed(file_id, error):
-    update_control(file_id,
-                   ingestion_status=F.lit("FAILED"),
-                   total_retries=F.coalesce(F.col("total_retries"), F.lit(0)) + 1,
-                   error_message=F.lit(str(error)[:1000]))
+    """The file could not be loaded. Keeps the first 1000 characters of the error."""
+    # transformation_status is left as it is: a failed download does not change
+    # whether the copy already in bronze still needs transforming.
+    spark.sql(f"""
+        UPDATE {CONTROL_TABLE}
+        SET ingestion_status = 'FAILED',
+            total_retries    = coalesce(total_retries, 0) + 1,
+            error_message    = {sql_value(str(error)[:1000])},
+            unique_run_id    = {sql_value(run_id)},
+            updated_at       = current_timestamp()
+        WHERE file_id = {sql_value(file_id)}
+    """)
+
 
 # METADATA ********************
 
@@ -520,23 +618,34 @@ def process_file(w):
 
 # CELL ********************
 
-# Process every file. The control row is saved after each one,
+# Process every file. The file control row is saved after each one,
 # so a re-run carries on from where the last one stopped
 results = []
 
-for i, w in enumerate(work, 1):
-    t0 = time.time()
-    try:
-        outcome, rows_loaded, size = process_file(w)
-    except Exception as e:
-        outcome, rows_loaded, size = "FAILED", None, None
-        mark_failed(w["file_id"], e)
+# Before the loop: clear staging leftovers from older runs and create this run's staging folder
+prepare_staging()
 
-    results.append({"file_name": w["file_name"], "outcome": outcome})
+try:
+    for i, w in enumerate(work, 1):
+        t0 = time.time()
+        try:
+            # HEAD check, then download + validate + move if the file is new or changed
+            outcome, rows_loaded, size = process_file(w)
+        except Exception as e:
+            # Any error for this file: record it and carry on with the next file
+            outcome, rows_loaded, size = "FAILED", None, None
+            mark_failed(w["file_id"], e)
 
-    size_mb = f'{size / 1024 / 1024:,.0f} MB' if size else "-"
-    rows_txt = f'{rows_loaded:,}' if rows_loaded is not None else "-"
-    print(f'[{i:>2}/{len(work)}] {w["file_name"]:<34} {outcome:<14} rows={rows_txt:<12} {size_mb:<8} {time.time() - t0:,.0f}s')
+        results.append({"file_name": w["file_name"], "outcome": outcome})
+
+        size_mb = f'{size / 1024 / 1024:,.0f} MB' if size else "-"
+        rows_txt = f'{rows_loaded:,}' if rows_loaded is not None else "-"
+        print(f'[{i:>2}/{len(work)}] {w["file_name"]:<34} {outcome:<14} rows={rows_txt:<12} {size_mb:<8} {time.time() - t0:,.0f}s')
+finally:
+    # After the loop: delete this run's staging folder.
+    # "finally" makes this run even if the loop stops with an error.
+    remove_staging()
+
 
 # METADATA ********************
 

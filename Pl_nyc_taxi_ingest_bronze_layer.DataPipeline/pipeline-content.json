@@ -38,6 +38,33 @@
         },
         "name": "nb_nyc_taxi_data_ingestion",
         "dependsOn": []
+      },
+      {
+        "type": "Office365Email",
+        "typeProperties": {
+          "body": "<p>@{activity('nb_nyc_taxi_data_ingestion').output.result.exitValue}</p>",
+          "to": "sanjay.baskaran@fusionpractices.com",
+          "subject": "Pipeline Run log"
+        },
+        "externalReferences": {
+          "connection": "94474a1f-d946-4ddc-b849-d6db6d0b7174"
+        },
+        "policy": {
+          "timeout": "0.12:00:00",
+          "retry": 0,
+          "retryIntervalInSeconds": 30,
+          "secureInput": false,
+          "secureOutput": false
+        },
+        "name": "Office365Email2",
+        "dependsOn": [
+          {
+            "activity": "nb_nyc_taxi_data_ingestion",
+            "dependencyConditions": [
+              "Completed"
+            ]
+          }
+        ]
       }
     ]
   }
