@@ -1,0 +1,11 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+  "metadata": {
+    "type": "Notebook",
+    "displayName": "nb_nyc_taxi_silver_layer_EDA"
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "4cfe86b7-3855-992a-4c1d-e401b98a3e92"
+  }
+}
